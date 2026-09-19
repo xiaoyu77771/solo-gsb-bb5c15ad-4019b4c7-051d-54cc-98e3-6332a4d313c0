@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -15,13 +16,16 @@ from .config import get_host, get_port
 from .models import (
     Allocation,
     BlendRequest,
+    ContingencyInfeasible,
+    ContingencyPlan,
     InfeasiblePlan,
     OptimalPlan,
     PlanCreateRequest,
 )
-from .solver import INDICATORS, SourceData, solve_blend
+from .solver import INDICATORS, SourceData, solve_blend, solve_contingency
 
 SolveResponse = Union[OptimalPlan, InfeasiblePlan]
+ContingencyResponse = Union[ContingencyPlan, ContingencyInfeasible]
 
 
 @asynccontextmanager
@@ -56,8 +60,8 @@ def _round6(obj: Any) -> Any:
     return obj
 
 
-def _solve(req: BlendRequest) -> Tuple[List[SourceData], Any]:
-    sources = sorted(
+def _source_data(req: BlendRequest) -> List[SourceData]:
+    return sorted(
         (
             SourceData(
                 id=s.id,
@@ -71,11 +75,20 @@ def _solve(req: BlendRequest) -> Tuple[List[SourceData], Any]:
         ),
         key=lambda s: s.id,
     )
+
+
+def _limits_from_request(req: BlendRequest) -> Dict[str, Tuple[float, float]]:
     limits = {}
     for name in INDICATORS:
         rng = getattr(req, name)
         if rng is not None:
             limits[name] = (rng.min, rng.max)
+    return limits
+
+
+def _solve(req: BlendRequest) -> Tuple[List[SourceData], Any]:
+    sources = _source_data(req)
+    limits = _limits_from_request(req)
     try:
         result = solve_blend(sources, req.target_volume, limits)
     except RuntimeError as exc:  # pragma: no cover - defensive
@@ -100,6 +113,43 @@ def _build_body(sources, req: BlendRequest, result, plan_id, created_at) -> Dict
         body = InfeasiblePlan(
             plan_id=plan_id,
             created_at=created_at,
+            message=result.message,
+            achievable_ranges=result.achievable_ranges,
+        )
+    return _round6(body.model_dump())
+
+
+def _contingency_body(
+    sources: List[SourceData],
+    plan_id: int,
+    original: Dict[str, float],
+    new_caps: Dict[str, float],
+    result,
+    target_volume: float,
+) -> Dict[str, Any]:
+    if result.status == "optimal":
+        body = ContingencyPlan(
+            plan_id=plan_id,
+            total_volume=target_volume,
+            total_cost=result.total_cost,
+            cost_delta=result.cost_delta,
+            total_adjustment=result.total_adjustment,
+            blend=[
+                {
+                    "source_id": s.id,
+                    "original_volume": original[s.id],
+                    "new_volume": float(v),
+                    "volume_delta": float(v - original[s.id]),
+                    "new_cap": float(new_caps.get(s.id, s.max_volume)),
+                    "cost": float(v * s.cost),
+                }
+                for s, v in zip(sources, result.volumes)
+            ],
+            indicators=result.indicators,
+        )
+    else:
+        body = ContingencyInfeasible(
+            plan_id=plan_id,
             message=result.message,
             achievable_ranges=result.achievable_ranges,
         )
@@ -203,6 +253,105 @@ def get_plan(plan_id: int) -> JSONResponse:
     if row is None:
         raise HTTPException(status_code=404, detail=f"plan {plan_id} not found")
     return JSONResponse(json.loads(row["response_json"]))
+
+
+@app.post(
+    "/api/v1/blends/{plan_id}/contingency",
+    response_model=ContingencyResponse,
+)
+def plan_contingency(plan_id: int, reductions: Dict[str, float]) -> JSONResponse:
+    """Re-optimize a saved optimal plan under reduced supply caps.
+
+    The request body maps existing source ids to their new supply caps.
+    At least one source must be listed, each new cap must satisfy
+    ``0 <= new_cap <= original max_volume``, and sources not listed keep
+    their original cap.  The target volume, indicator windows, water
+    quality (source concentrations) and costs are taken from the stored
+    request.  Among feasible allocations the service first minimizes the
+    total absolute volume change versus the saved blend, then the total
+    cost, and finally takes the id-sorted usage-vector lexicographic
+    minimum.
+
+    The contingency result is neither saved nor does it modify the
+    original plan.  Infeasibility under the new caps is reported with
+    ``200`` and ``"status": "infeasible"``.
+    """
+    row = db.find_by_id(plan_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"plan {plan_id} not found")
+    if row["status"] != "optimal":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"plan {plan_id} has status '{row['status']}'; contingencies can "
+                "only be derived from plans with status 'optimal'"
+            ),
+        )
+    if not reductions:
+        raise HTTPException(
+            status_code=422,
+            detail="at least one source id with a new supply cap is required",
+        )
+
+    req = BlendRequest.model_validate(json.loads(row["request_json"]))
+    sources = _source_data(req)
+    by_id = {s.id: s for s in sources}
+
+    unknown = sorted(set(reductions) - set(by_id))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown source id(s): {', '.join(unknown)}; only sources of "
+            "the saved plan may be listed",
+        )
+    bad = [
+        sid for sid, cap in reductions.items()
+        if not math.isfinite(cap) or cap < 0
+    ]
+    if bad:
+        raise HTTPException(
+            status_code=422,
+            detail=f"new caps must be finite and non-negative; bad values for: "
+            f"{', '.join(sorted(bad))}",
+        )
+    exceeded = [
+        sid for sid, cap in reductions.items()
+        if cap > float(by_id[sid].max_volume)
+    ]
+    if exceeded:
+        raise HTTPException(
+            status_code=422,
+            detail="new cap must not exceed the original max_volume: "
+            + ", ".join(
+                f"{sid} (original max {by_id[sid].max_volume:g})"
+                for sid in sorted(exceeded)
+            ),
+        )
+
+    stored = json.loads(row["response_json"])
+    original = {a["source_id"]: float(a["volume"]) for a in stored["blend"]}
+
+    try:
+        result = solve_contingency(
+            sources,
+            req.target_volume,
+            _limits_from_request(req),
+            original,
+            {sid: float(cap) for sid, cap in reductions.items()},
+        )
+    except RuntimeError as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return JSONResponse(
+        _contingency_body(
+            sources,
+            plan_id,
+            original,
+            {sid: float(cap) for sid, cap in reductions.items()},
+            result,
+            req.target_volume,
+        )
+    )
 
 
 if __name__ == "__main__":

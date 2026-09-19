@@ -80,3 +80,34 @@ class InfeasiblePlan(BaseModel):
     created_at: Optional[str] = None
     message: str
     achievable_ranges: Dict[str, Any]
+
+
+class ContingencyAllocation(BaseModel):
+    source_id: str
+    original_volume: float
+    new_volume: float
+    volume_delta: float
+    new_cap: float
+    cost: float
+
+
+class ContingencyPlan(BaseModel):
+    """Optimal supply-reduction contingency re-allocation (not persisted)."""
+
+    status: Literal["optimal"] = "optimal"
+    plan_id: int
+    total_volume: float
+    total_cost: float
+    cost_delta: float
+    total_adjustment: float
+    blend: List[ContingencyAllocation]
+    indicators: Dict[str, float]
+
+
+class ContingencyInfeasible(BaseModel):
+    """No feasible allocation exists under the reduced supply caps."""
+
+    status: Literal["infeasible"] = "infeasible"
+    plan_id: int
+    message: str
+    achievable_ranges: Dict[str, Any]
