@@ -3,7 +3,8 @@
 基于 **Python + FastAPI + SciPy + SQLite** 的饮用水混配优化服务。用户提交目标体积、
 钙 / 镁 / 碱度区间以及 2～6 种水源的浓度、可用量与单位成本，服务求解满足全部区间
 与供给上限的**最低成本配比**；成本并列时取**按水源 ID 排序后用量向量字典序最小**
-的方案；问题不可行时返回**各指标的可达范围**。支持以**幂等键**保存方案并按 ID 查询。
+的方案；问题不可行时返回**各指标的可达范围**。支持以**幂等键**保存方案并按 ID 查询，
+并可为已保存的最优方案计算**供给缩减预案**（调整量优先、成本次之、字典序收尾）。
 
 ## 快速开始（单条命令：安装 + 建库 + 启动）
 
@@ -103,6 +104,80 @@ curl http://localhost:8000/api/v1/blends/1
 
 不存在时返回 `404`。
 
+### `POST /api/v1/blends/{plan_id}/contingency` — 供给缩减预案
+
+对**已保存且状态为 `optimal`** 的方案，在部分水源供给上限临时下调时重新计算配比。
+请求体为「已有水源 ID → 新供给上限」的映射：至少包含一项，要求 `0 ≤ 新上限 ≤ 原上限`；
+未列出的水源沿用原上限。**预案不会被保存，原方案也不做任何修改。**
+
+目标体积、指标区间、水质浓度与单位成本全部保持不变，按以下层级目标重新优化：
+
+1. **总调整量最小**：`Σ |新用量 − 原用量|` 最小；
+2. **总成本最小**：在最小调整量的所有配比中最小化总成本；
+3. **字典序收尾**：仍并列时，按水源 ID 升序排列的用量向量取字典序最小者。
+
+```bash
+# 先保存一个方案（plan_id 见响应，例如 1）
+curl -X POST http://localhost:8000/api/v1/blends \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: order-2026-0001' \
+  -d '<同上请求体>'
+
+# 将 W1 的供给上限由 600 缩减到 400
+curl -X POST http://localhost:8000/api/v1/blends/1/contingency \
+  -H 'Content-Type: application/json' \
+  -d '{"reductions": {"W1": 400}}'
+```
+
+最优响应（`200`）：
+
+```json
+{
+  "status": "optimal",
+  "plan_id": 1,
+  "total_volume": 1000.0,
+  "original_total_cost": 1500.0,
+  "total_cost": 1600.0,
+  "cost_delta": 100.0,
+  "total_adjustment": 200.0,
+  "reductions": {"W1": 400.0},
+  "blend": [
+    {"source_id": "W1", "volume": 400.0, "cost": 400.0,  "volume_delta": -100.0,
+     "original_volume": 500.0, "original_max_volume": 600.0, "effective_max_volume": 400.0},
+    {"source_id": "W2", "volume": 600.0, "cost": 1200.0, "volume_delta": 100.0,
+     "original_volume": 500.0, "original_max_volume": 800.0, "effective_max_volume": 800.0}
+  ],
+  "indicators": {"calcium": 52.0, "magnesium": 15.0, "alkalinity": 148.0}
+}
+```
+
+- `total_adjustment`：各水源用量差绝对值之和（总调整量）；
+- `cost_delta`：新成本 − 旧成本（非负：调整量相同时取成本最小者）；
+- 每条 `blend` 同时给出新旧用量（`volume` / `original_volume`）、用量差
+  `volume_delta`、原上限 `original_max_volume` 与生效上限 `effective_max_volume`；
+- 缩减后仍可行但无需调整时（新上限不低于当前用量），`total_adjustment` 与
+  `cost_delta` 均为 `0`。
+
+缩减后问题不可行时（例如总可用水量已不足目标体积）返回 `200` 及原因，
+**不保存预案、不修改原方案**：
+
+```json
+{
+  "status": "infeasible",
+  "plan_id": 1,
+  "message": "total available volume 900 is below the target 1000; calcium: ...",
+  "reductions": {"W1": 100.0},
+  "achievable_ranges": { "volume": {"requested": 1000.0, "max": 900.0}, "..." : {} }
+}
+```
+
+错误码：
+
+| 情况 | 状态码 |
+| ---- | ------ |
+| `plan_id` 不存在 | `404` |
+| 原方案状态不是 `optimal`（含不可行方案） | `422` |
+| 映射为空、水源 ID 不存在于原方案、新上限为负或超过原上限 | `422` |
+
 ### 不可行响应
 
 问题不可行时（求解与保存接口均）返回 `200` 及结构化说明，例如钙下限 70 超过可达上限：
@@ -132,7 +207,14 @@ curl http://localhost:8000/api/v1/blends/1
 - **成本并列**：在所有最优解中，按水源 ID 升序排列的用量向量取**字典序最小**者
   （依次最小化 x₁, x₂, …；通过一系列 LP 精确实现）。水源 ID 为字符串，按字典序排序。
 - **区间缺省**：`calcium` / `magnesium` / `alkalinity` 任一区间可省略，表示该指标不设限。
+- **供给缩减预案**：`POST /api/v1/blends/{plan_id}/contingency` 读取已保存 `optimal`
+  方案的原请求与配比，以新上限替换相应 `x_i ≤ max_volume_i` 后分层求解——
+  先最小化 `Σ d_i`（偏差线性化：`x_i − x0_i ≤ d_i`、`x0_i − x_i ≤ d_i`、`d_i ≥ 0`），
+  再以等式固定最小调整量并最小化成本，最后在并列解中对按 ID 升序的用量向量做字典序最小化；
+  不可行时返回与求解接口一致的可达范围说明。仅计算、不落库、不改原方案。
 - **校验**：水源数量 2～6、ID 唯一、`min ≤ max`、数值非负（目标体积为正）；不满足返回 `422`。
+  预案接口额外校验：方案存在（否则 `404`）、原方案状态为 `optimal`、映射非空、
+  每个新上限满足 `0 ≤ 新上限 ≤ 原上限` 且水源 ID 来自原方案（否则 `422`）。
 - **幂等**：以幂等键唯一索引存储；请求体（不含键本身）做 SHA-256 指纹比对，防止键被
   不同请求复用。
 
@@ -142,8 +224,9 @@ curl http://localhost:8000/api/v1/blends/1
 pip install -r requirements-dev.txt && pytest
 ```
 
-共 20 个用例，覆盖求解器（最优性、字典序并列、不可行范围）与 API（幂等回放 / 冲突、
-按 ID 查询、参数校验等）。
+共 32 个用例，覆盖求解器（最优性、字典序并列、不可行范围、供给缩减的调整量优先 /
+成本次之 / 字典序收尾与不可行判定）与 API（幂等回放 / 冲突、按 ID 查询、参数校验、
+预案接口的重算结果、不落库不改原方案、404 / 422 错误路径等）。
 
 ## 项目结构
 

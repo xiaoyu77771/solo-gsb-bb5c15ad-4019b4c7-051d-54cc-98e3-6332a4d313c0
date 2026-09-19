@@ -161,3 +161,122 @@ def test_validation_bad_range_and_duplicate_ids(client):
 
     neg = make_request(target_volume=-5)
     assert client.post("/api/v1/blends/solve", json=neg).status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# supply-cut contingency
+# --------------------------------------------------------------------------- #
+
+def _save_plan(client, key="cont-plan", **overrides):
+    r = client.post("/api/v1/blends", json=make_request(idempotency_key=key, **overrides))
+    assert r.status_code == 201
+    return r.json()
+
+
+def test_contingency_reblends_optimal_plan(client):
+    plan = _save_plan(client)
+    assert [(a["source_id"], a["volume"]) for a in plan["blend"]] == [
+        ("W1", 500.0), ("W2", 500.0)
+    ]
+    r = client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency",
+        json={"reductions": {"W1": 400}},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "optimal"
+    assert body["plan_id"] == plan["plan_id"]
+    assert body["total_volume"] == 1000.0
+    assert body["reductions"] == {"W1": 400.0}
+
+    by_id = {a["source_id"]: a for a in body["blend"]}
+    assert by_id["W1"]["volume"] == pytest.approx(400.0, abs=1e-6)
+    assert by_id["W2"]["volume"] == pytest.approx(600.0, abs=1e-6)
+    assert by_id["W1"]["volume_delta"] == pytest.approx(-100.0, abs=1e-6)
+    assert by_id["W2"]["volume_delta"] == pytest.approx(100.0, abs=1e-6)
+    assert by_id["W1"]["original_volume"] == 500.0
+    assert by_id["W1"]["original_max_volume"] == 600.0
+    assert by_id["W1"]["effective_max_volume"] == 400.0
+    assert by_id["W2"]["effective_max_volume"] == 800.0
+    assert body["total_adjustment"] == pytest.approx(200.0, abs=1e-6)
+    assert body["original_total_cost"] == pytest.approx(1500.0, abs=1e-6)
+    assert body["total_cost"] == pytest.approx(1600.0, abs=1e-6)
+    assert body["cost_delta"] == pytest.approx(100.0, abs=1e-6)
+    assert body["indicators"]["calcium"] == pytest.approx(52.0, abs=1e-6)
+
+
+def test_contingency_zero_change_when_cut_is_above_use(client):
+    plan = _save_plan(client, key="cont-zero")
+    r = client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency",
+        json={"reductions": {"W1": 500}},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_adjustment"] == pytest.approx(0.0, abs=1e-6)
+    assert body["cost_delta"] == pytest.approx(0.0, abs=1e-6)
+    assert {a["source_id"]: a["volume"] for a in body["blend"]} == {
+        "W1": 500.0, "W2": 500.0
+    }
+
+
+def test_contingency_does_not_modify_or_save(client):
+    plan = _save_plan(client, key="cont-readonly")
+    client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency",
+        json={"reductions": {"W1": 400}},
+    )
+    stored = client.get(f"/api/v1/blends/{plan['plan_id']}").json()
+    assert stored == plan
+    # no extra rows persisted either
+    assert client.get("/api/v1/blends/9999").status_code == 404
+
+
+def test_contingency_infeasible_returns_reason(client):
+    plan = _save_plan(client, key="cont-inf")
+    r = client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency",
+        json={"reductions": {"W1": 100}},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "infeasible"
+    assert body["plan_id"] == plan["plan_id"]
+    assert body["reductions"] == {"W1": 100.0}
+    assert body["achievable_ranges"]["volume"]["max"] == pytest.approx(900.0)
+    assert "below the target" in body["message"]
+    # the original optimal plan is still intact
+    stored = client.get(f"/api/v1/blends/{plan['plan_id']}").json()
+    assert stored["status"] == "optimal"
+
+
+def test_contingency_unknown_plan_is_404(client):
+    r = client.post("/api/v1/blends/9999/contingency", json={"reductions": {"W1": 1}})
+    assert r.status_code == 404
+
+
+def test_contingency_non_optimal_plan_is_422(client):
+    r = client.post(
+        "/api/v1/blends",
+        json=make_request(idempotency_key="cont-bad-plan", calcium={"min": 70, "max": 90}),
+    )
+    assert r.status_code == 201
+    pid = r.json()["plan_id"]
+    resp = client.post(f"/api/v1/blends/{pid}/contingency", json={"reductions": {"W1": 1}})
+    assert resp.status_code == 422
+    assert "optimal" in resp.json()["detail"]
+
+
+def test_contingency_validation_errors_are_422(client):
+    plan = _save_plan(client, key="cont-valid")
+    base = f"/api/v1/blends/{plan['plan_id']}/contingency"
+
+    assert client.post(base, json={"reductions": {}}).status_code == 422
+    assert client.post(base, json={"reductions": {"NOPE": 10}}).status_code == 422
+    assert client.post(base, json={"reductions": {"W1": -0.001}}).status_code == 422
+    # above the original supply cap (600 for W1), not just above current use
+    assert client.post(base, json={"reductions": {"W1": 601}}).status_code == 422
+    # cap exactly at the original maximum is legal (no change in that cap)
+    ok = client.post(base, json={"reductions": {"W1": 600}})
+    assert ok.status_code == 200
+    assert client.post(base, json={"reductions": {"W1": "x"}}).status_code == 422

@@ -80,3 +80,54 @@ class InfeasiblePlan(BaseModel):
     created_at: Optional[str] = None
     message: str
     achievable_ranges: Dict[str, Any]
+
+
+class ContingencyRequest(BaseModel):
+    """Supply-cut contingency: existing source id -> new supply cap."""
+
+    reductions: Dict[str, float] = Field(
+        ...,
+        min_length=1,
+        description="已有水源 ID 到新供给上限的映射；未列出的水源沿用原上限",
+    )
+
+    @field_validator("reductions")
+    @classmethod
+    def _finite(cls, v: Dict[str, float]) -> Dict[str, float]:
+        for sid, cap in v.items():
+            if not isinstance(sid, str) or not sid.strip():
+                raise ValueError("source ids must be non-empty strings")
+            if cap != cap or cap in (float("inf"), float("-inf")):
+                raise ValueError(f"new cap for source {sid!r} must be a finite number")
+        return v
+
+
+class ContingencyAllocation(BaseModel):
+    source_id: str
+    volume: float
+    cost: float
+    volume_delta: float          # new volume - original volume
+    original_volume: float
+    original_max_volume: float
+    effective_max_volume: float  # the cap in effect after the reduction
+
+
+class ContingencyPlan(BaseModel):
+    status: Literal["optimal"] = "optimal"
+    plan_id: int
+    total_volume: float
+    original_total_cost: float
+    total_cost: float
+    cost_delta: float            # new total cost - original total cost
+    total_adjustment: float      # sum of |volume_delta|
+    reductions: Dict[str, float]
+    blend: List[ContingencyAllocation]
+    indicators: Dict[str, float]
+
+
+class ContingencyInfeasible(BaseModel):
+    status: Literal["infeasible"] = "infeasible"
+    plan_id: int
+    message: str
+    reductions: Dict[str, float]
+    achievable_ranges: Dict[str, Any]

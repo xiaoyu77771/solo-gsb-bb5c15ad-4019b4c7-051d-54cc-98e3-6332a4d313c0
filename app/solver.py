@@ -14,6 +14,11 @@ ascending source id is minimized lexicographically via a sequence of LPs.
 
 If the problem is infeasible, the achievable (min, max) concentration range of
 every indicator is reported, projected onto the supply/volume feasible set.
+
+``solve_contingency`` handles a supply-cut on a previously saved optimal
+blend: with deviation variables d_i (|x_i - x0_i| <= d_i) it lexicographically
+minimizes (sum d_i, total cost, x_1, ..., x_n) under the reduced caps, keeping
+the target volume, indicator ranges and costs unchanged.
 """
 from __future__ import annotations
 
@@ -25,10 +30,6 @@ from scipy.optimize import linprog
 
 INDICATORS: Tuple[str, ...] = ("calcium", "magnesium", "alkalinity")
 
-# Half-width (relative) of the interval used to pin a variable after its
-# lexicographic minimum has been found.  Comfortably above solver noise and
-# below the 6-decimal output rounding for typical magnitudes.
-_FIX_RTOL = 1e-8
 # Fallback cost slack (relative) if the exact cost-equality refinement fails.
 _COST_RTOL = 1e-9
 
@@ -51,6 +52,7 @@ class SolveOutput:
     indicators: Optional[Dict[str, float]] = None
     achievable_ranges: Optional[Dict[str, dict]] = None
     message: Optional[str] = None
+    total_adjustment: Optional[float] = None  # min sum |x_i - x0_i| (contingency)
 
 
 def solve_blend(
@@ -103,6 +105,134 @@ def solve_blend(
     )
 
 
+def solve_contingency(
+    sources: List[SourceData],
+    target_volume: float,
+    limits: Dict[str, Tuple[float, float]],
+    original_volumes: np.ndarray,
+    new_caps: Dict[str, float],
+) -> SolveOutput:
+    """Re-blend after a supply-cut contingency.
+
+    Unchanged target volume, indicator ranges and costs; the affected source
+    caps are replaced by ``new_caps`` (already validated against the originals).
+
+    Hierarchical objective:
+      1. minimize the total adjustment ``sum_i |x_i - x0_i|``;
+      2. among minimum-adjustment blends, minimize total cost;
+      3. lexicographically minimize the id-ordered usage vector on final ties.
+
+    Deviations are linearized as ``x_i - x0_i <= d_i`` and ``x0_i - x_i <= d_i``
+    with ``d_i >= 0``.
+    """
+    sources = sorted(sources, key=lambda s: s.id)
+    n = len(sources)
+    costs = np.array([s.cost for s in sources], dtype=float)
+    x0 = np.asarray(original_volumes, dtype=float)
+    cap_by_id = {s.id: float(new_caps.get(s.id, s.max_volume)) for s in sources}
+    x_bounds = [(0.0, cap_by_id[s.id]) for s in sources]
+
+    A_eq = np.ones((1, n))
+    b_eq = np.array([float(target_volume)])
+
+    rows, rhs = [], []
+    for name in INDICATORS:
+        rng = limits.get(name)
+        if rng is None:
+            continue
+        lo, hi = rng
+        conc = np.array([getattr(s, name) for s in sources], dtype=float)
+        rows.append(-conc)
+        rhs.append(-lo * target_volume)
+        rows.append(conc)
+        rhs.append(hi * target_volume)
+
+    # Deviation variables d_i appended after the x_i variables.
+    def with_devs(mat: Optional[np.ndarray]) -> np.ndarray:
+        if mat is None:
+            return np.zeros((0, 2 * n))
+        return np.hstack([mat, np.zeros((mat.shape[0], n))])
+
+    A_ub = with_devs(np.asarray(rows) if rows else None)
+    b_ub = np.asarray(rhs) if rows else np.zeros(0)
+    eye = np.eye(n)
+    dev_rows = np.vstack([
+        np.hstack([eye, -eye]),    # x_i - x0_i <= d_i
+        np.hstack([-eye, -eye]),   # x0_i - x_i <= d_i
+    ])
+    A_ub = np.vstack([A_ub, dev_rows])
+    b_ub = np.concatenate([b_ub, x0, -x0])
+    A_eq_ext = np.hstack([A_eq, np.zeros((1, n))])
+    bounds = x_bounds + [(0.0, None)] * n
+
+    # Stage 1: feasibility check + minimum total adjustment.
+    res = linprog(
+        np.concatenate([np.zeros(n), np.ones(n)]),
+        A_ub=A_ub, b_ub=b_ub, A_eq=A_eq_ext, b_eq=b_eq,
+        bounds=bounds, method="highs",
+    )
+    if res.status == 2:  # provably infeasible
+        return _infeasible(sources, target_volume, limits, x_bounds)
+    if res.status != 0:
+        raise RuntimeError(f"LP solver failed (status {res.status}): {res.message}")
+
+    d_star = float(res.x[n:].sum())
+    pin_adj = np.concatenate([np.zeros(n), np.ones(n)]).reshape(1, -1)
+
+    # Stages 2/3 pin the earlier optima as equalities so later lexicographic
+    # objectives cannot drift into a pin's slack; fall back to tight
+    # inequalities if an exact pin proves numerically unsatisfiable.
+    try:
+        # Stage 2: keep the minimum adjustment, minimize total cost.
+        A_eq2 = np.vstack([A_eq_ext, pin_adj])
+        b_eq2 = np.append(b_eq, d_star)
+        res2 = linprog(
+            np.concatenate([costs, np.zeros(n)]),
+            A_ub=A_ub, b_ub=b_ub, A_eq=A_eq2, b_eq=b_eq2,
+            bounds=bounds, method="highs",
+        )
+        if res2.status != 0:
+            raise RuntimeError(f"contingency cost refinement failed: {res2.message}")
+        cost_star = float(costs @ res2.x[:n])
+
+        # Stage 3: pin cost as well, lexicographically minimize the usage
+        # vector (only the x_i variables; d_i stay free beyond index n-1).
+        pin_cost = np.concatenate([costs, np.zeros(n)]).reshape(1, -1)
+        A_eq3 = np.vstack([A_eq2, pin_cost])
+        b_eq3 = np.append(b_eq2, cost_star)
+        x_full = _sequential_min(2 * n, A_ub, b_ub, A_eq3, b_eq3, bounds, count=n)
+    except RuntimeError:
+        tol_adj = _COST_RTOL * max(1.0, abs(d_star))
+        A_ub2 = np.vstack([A_ub, pin_adj])
+        b_ub2 = np.append(b_ub, d_star + tol_adj)
+        res2 = linprog(
+            np.concatenate([costs, np.zeros(n)]),
+            A_ub=A_ub2, b_ub=b_ub2, A_eq=A_eq_ext, b_eq=b_eq,
+            bounds=bounds, method="highs",
+        )
+        if res2.status != 0:  # pragma: no cover - defensive
+            raise RuntimeError(f"contingency cost refinement failed: {res2.message}")
+        cost_star = float(costs @ res2.x[:n])
+        tol_cost = _COST_RTOL * max(1.0, abs(cost_star))
+        pin_cost = np.concatenate([costs, np.zeros(n)]).reshape(1, -1)
+        A_ub3 = np.vstack([A_ub2, pin_cost])
+        b_ub3 = np.append(b_ub2, cost_star + tol_cost)
+        x_full = _sequential_min(2 * n, A_ub3, b_ub3, A_eq_ext, b_eq, bounds, count=n)
+    x = x_full[:n]
+
+    indicators = {
+        name: float(np.array([getattr(s, name) for s in sources]) @ x) / target_volume
+        for name in INDICATORS
+    }
+    return SolveOutput(
+        status="optimal",
+        volumes=x,
+        total_cost=float(costs @ x),
+        indicators=indicators,
+        total_adjustment=float(np.abs(x - x0).sum()),
+    )
+
+
 def _lexicographic_min(costs, x_star, A_ub, b_ub, A_eq, b_eq, bounds) -> np.ndarray:
     """Among all cost-optimal solutions, minimize (x_1, ..., x_n)
     lexicographically (indices follow the id-sorted source order)."""
@@ -126,21 +256,34 @@ def _lexicographic_min(costs, x_star, A_ub, b_ub, A_eq, b_eq, bounds) -> np.ndar
         return _sequential_min(n, A_ub2, b_ub2, A_eq, b_eq, bounds)
 
 
-def _sequential_min(n, A_ub, b_ub, A_eq, b_eq, bounds) -> np.ndarray:
-    bnds = list(bounds)
+def _sequential_min(n, A_ub, b_ub, A_eq, b_eq, bounds, count: Optional[int] = None) -> np.ndarray:
+    """Minimize (x_1, ..., x_count) lexicographically (default: all vars).
+
+    Indices follow the id-sorted source order.  Variables beyond ``count`` are
+    left free.  Each previously minimized variable is pinned to its found
+    value with an exact equality row (the original bounds stay untouched),
+    avoiding the compounded slack of shrinking several intervals."""
+    count = n if count is None else min(count, n)
+    fix_rows, fix_rhs = [], []
     x = np.zeros(n)
-    for k in range(n):
+    for k in range(count):
+        Aeq = A_eq if not fix_rows else np.vstack(
+            [A_eq, np.asarray(fix_rows).reshape(-1, n)]
+        )
+        beq = b_eq if not fix_rhs else np.append(b_eq, fix_rhs)
         obj = np.zeros(n)
         obj[k] = 1.0
-        r = linprog(obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
-                    bounds=bnds, method="highs")
+        r = linprog(obj, A_ub=A_ub, b_ub=b_ub, A_eq=Aeq, b_eq=beq,
+                    bounds=bounds, method="highs")
         if r.status != 0:
             raise RuntimeError(f"lexicographic refinement failed at index {k}: {r.message}")
         lo0, hi0 = bounds[k]
-        v = min(max(float(r.x[k]), lo0), hi0)
+        v = min(max(float(r.x[k]), lo0), hi0 if hi0 is not None else float(r.x[k]))
         x[k] = v
-        eps = _FIX_RTOL * max(1.0, abs(v))
-        bnds[k] = (max(lo0, v - eps), min(hi0, v + eps))
+        row = np.zeros(n)
+        row[k] = 1.0
+        fix_rows.append(row)
+        fix_rhs.append(v)
     return x
 
 
